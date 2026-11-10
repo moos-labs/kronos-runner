@@ -1,0 +1,2 @@
+yahooquery>=2.3.7
+requests>=2.32
