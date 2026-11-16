@@ -87,7 +87,15 @@ def fetch_data(ticker):
 
 def clean(df):
     df = df.copy()
-    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
+    # Normalise per value: yahooquery can return a frame mixing tz-aware
+    # and tz-naive dates, and .dt.tz_localize(None) raises ValueError on
+    # such a mix (#111, run 43807031623). Parsing with utc=True coerces
+    # every value to UTC first, then the tz is dropped — same pattern as
+    # fetch_chart_api above. format="mixed" also tolerates mixed string
+    # formats (offsets vs plain). .normalize() behaviour is unchanged.
+    df["date"] = (
+        pd.to_datetime(df["date"], utc=True, format="mixed").dt.tz_convert(None).dt.normalize()
+    )
     for col in ("open", "high", "low", "close", "volume"):
         if col not in df.columns:
             df[col] = 0.0 if col == "volume" else float("nan")
