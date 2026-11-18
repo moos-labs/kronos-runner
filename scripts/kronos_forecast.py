@@ -16,6 +16,7 @@ session and FLAG the merger discontinuity in the report.
 """
 import argparse
 import os
+import subprocess
 import sys
 import time
 
@@ -25,6 +26,7 @@ RESULTS_DIR = "results"
 DROP_BEFORE = pd.Timestamp("2019-01-01")
 MODEL_ID = "NeoQuasar/Kronos-small"
 TOKENIZER_ID = "NeoQuasar/Kronos-Tokenizer-base"
+UPSTREAM_KRONOS_REPO = "https://github.com/shiyu-coder/Kronos.git"
 
 
 def fetch_yahooquery(ticker):
@@ -117,10 +119,51 @@ def next_sessions(last_date, n):
     return pd.Series(out)
 
 
+def ensure_kronos_src(kronos_src="kronos_src", run=None):
+    """Clone the upstream Kronos model package when it is missing.
+
+    Kronos is not a PyPI package: run_forecast imports its `model`
+    package from kronos_src/. The runner's own CI does this clone in
+    .github/workflows/run.yml, but the worker path never did -- so on
+    worker-5 `from model import Kronos` would fail right after the
+    torch import was fixed (issue #198: the torch error only masked
+    the missing-src error). Returns True when it cloned, False when
+    kronos_src/model already existed. Raises RuntimeError if the
+    clone or the upstream requirements install fails, so the tool
+    fails loudly instead of running against a half-present model.
+    CPU torch is installed first (this repo's requirements.txt, the
+    PyTorch CPU wheel index), so the upstream `torch>=2.0.0` line is
+    already satisfied and pip does not pull the CUDA wheel.
+    """
+    if os.path.isdir(os.path.join(kronos_src, "model")):
+        return False
+    run = run or subprocess.run
+    r = run(["git", "clone", "--depth", "1",
+             UPSTREAM_KRONOS_REPO, kronos_src],
+            capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise RuntimeError(
+            "cloning upstream Kronos failed: %s"
+            % ((r.stderr or r.stdout or "")[-500:]))
+    req = os.path.join(kronos_src, "requirements.txt")
+    if os.path.isfile(req):
+        r = run([sys.executable, "-m", "pip", "install", "-q",
+                 "-r", req], capture_output=True, text=True,
+                timeout=1800)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "installing upstream Kronos requirements failed: %s"
+                % ((r.stderr or r.stdout or "")[-500:]))
+    return True
+
+
 def run_forecast(context_df, pred_len):
     # Kronos is not a PyPI package: the workflow clones the upstream repo
     # into kronos_src/ and we import its `model` package from there.
     kronos_src = os.environ.get("KRONOS_SRC", "kronos_src")
+    # Issue #198: provision kronos_src on the worker path too (the
+    # runner's CI does this in run.yml; the worker never did).
+    ensure_kronos_src(kronos_src)
     if os.path.isdir(os.path.join(kronos_src, "model")):
         sys.path.insert(0, os.path.abspath(kronos_src))
     else:
