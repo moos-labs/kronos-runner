@@ -108,6 +108,45 @@ def clean(df):
     return df
 
 
+def truncate_asof(df, as_of, min_rows):
+    """Walk-forward cutoff (borsagator #436): keep only sessions on or
+    before ``as_of`` (YYYY-MM-DD), then fail loudly if fewer than
+    ``min_rows`` sessions remain.
+
+    Truncation happens here, inside the runner after fetch and before
+    any model call, so no row dated after the cutoff can reach Kronos.
+    ``as_of`` itself is kept. A cutoff on a non-session date keeps the
+    last session on/before it.
+    """
+    cutoff = pd.Timestamp(as_of)
+    out = df[df["date"] <= cutoff].reset_index(drop=True)
+    if len(out) < min_rows:
+        raise RuntimeError(
+            f"--as-of {as_of}: only {len(out)} sessions on/before the "
+            f"cutoff (< {min_rows} minimum rows); refusing to forecast"
+        )
+    return out
+
+
+def select_context(df, context_start, fallback_len, min_context):
+    """Preferred window ``context_start``..latest session; if that window
+    is below ``min_context`` sessions, fall back to the last
+    ``fallback_len`` sessions. Returns (context, fallback_used, reason).
+
+    "Latest session" is the last row of ``df`` -- after --as-of
+    truncation that is the as-of session, so the same rule serves the
+    live run and the backtest, with as-of substituted for "today".
+    """
+    preferred = df[df["date"] >= pd.Timestamp(context_start)].reset_index(drop=True)
+    if len(preferred) >= min_context:
+        return preferred, False, ""
+    reason = (
+        f"preferred window ({context_start} onwards) has only "
+        f"{len(preferred)} sessions (< {min_context} minimum)"
+    )
+    return df.tail(fallback_len).reset_index(drop=True), True, reason
+
+
 def next_sessions(last_date, n):
     """Next n EGX sessions (Sun-Thu; Fri/Sat weekend). Holidays not modelled."""
     out = []
@@ -210,6 +249,11 @@ def main():
     ap.add_argument("--fallback-len", type=int, default=400)
     ap.add_argument("--min-context", type=int, default=20,
                     help="Below this many preferred sessions, go straight to fallback")
+    ap.add_argument("--as-of", default=None,
+                    help="Walk-forward cutoff (YYYY-MM-DD, borsagator #436): "
+                         "drop every session after this date before any "
+                         "model call, so the forecast sees only data "
+                         "available at the close of that date.")
     args = ap.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -218,23 +262,18 @@ def main():
     df = clean(df)
     if df.empty:
         raise RuntimeError("No usable rows after cleaning")
+    if args.as_of:
+        df = truncate_asof(df, args.as_of, args.min_context)
+        print(f"[as-of] cutoff={args.as_of} rows_on_or_before={len(df)} "
+              f"last_session={df['date'].iloc[-1].date()}")
     print(f"[data] cleaned_rows={len(df)} range={df['date'].iloc[0].date()}..{df['date'].iloc[-1].date()}")
 
     last_actual_close = float(df["close"].iloc[-1])
     last_actual_date = pd.Timestamp(df["date"].iloc[-1])
 
-    preferred = df[df["date"] >= pd.Timestamp(args.context_start)].reset_index(drop=True)
-    fallback_used = False
-    fallback_reason = ""
-    context = preferred
-    if len(preferred) < args.min_context:
-        fallback_used = True
-        fallback_reason = (
-            f"preferred window ({args.context_start} onwards) has only "
-            f"{len(preferred)} sessions (< {args.min_context} minimum)"
-        )
-        context = df.tail(args.fallback_len).reset_index(drop=True)
-    print(f"[context] preferred_sessions={len(preferred)} using={len(context)} fallback={fallback_used}")
+    context, fallback_used, fallback_reason = select_context(
+        df, args.context_start, args.fallback_len, args.min_context)
+    print(f"[context] preferred_sessions={len(df[df['date'] >= pd.Timestamp(args.context_start)])} using={len(context)} fallback={fallback_used}")
 
     try:
         pred_df = run_forecast(context, args.pred_len)
@@ -270,6 +309,8 @@ def main():
     lines.append(f"- Model: `{MODEL_ID}` with tokenizer `{TOKENIZER_ID}` (CPU inference, seed 42, T=1.0, top_p=0.9, sample_count=1)")
     lines.append(f"- Data source: {source} (yfinance is never used for Cairo tickers — Africa/Cairo DST crash; rows before 2019-01-01 dropped as corrupted)")
     lines.append(f"- Context window used: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
+    if args.as_of:
+        lines.append(f"- As-of cutoff: {args.as_of} (walk-forward backtest, borsagator #436 — every session after the cutoff was dropped before the model ran; context ends at the cutoff)")
     if fallback_used:
         lines.append(f"- **FALLBACK USED**: {fallback_reason}. The fallback window spans the POUL merger discontinuity, so pre-merger and post-merger prices are mixed in one context — treat this forecast with extra caution.")
     else:
