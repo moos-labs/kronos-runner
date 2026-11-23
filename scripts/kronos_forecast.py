@@ -420,7 +420,7 @@ def main():
     lines.append("")
     lines.append(f"- Model: `{MODEL_ID}` with tokenizer `{TOKENIZER_ID}` (CPU inference, seed 42, T=1.0, top_p=0.9, sample_count=1)")
     lines.append(f"- Data source: {source} (yfinance is never used for Cairo tickers — Africa/Cairo DST crash; rows before 2019-01-01 dropped as corrupted)")
-    lines.append(f"- Context window selected: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
+    lines.append(f"- Context window used: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
     if args.as_of:
         lines.append(f"- As-of cutoff: {args.as_of} (walk-forward backtest, borsagator #436 — every session after the cutoff was dropped before the model ran; context ends at the cutoff)")
     meta = LAST_RUN_META
