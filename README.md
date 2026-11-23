@@ -45,6 +45,13 @@ a script failure and the run would wrongly show as success.)
   first from the PyTorch CPU wheel index. The Hugging Face cache
   (`~/.cache/huggingface`) is cached with `actions/cache` under a
   `kronos-hf-v1-` key so reruns skip the model download.
+- **Multi-sampling:** Kronos is a sampling model, so the forecast
+  aggregates **32 draws** (override with `--samples` or the
+  `KRONOS_SAMPLES` env var; `1` reproduces the old single-draw
+  behaviour). The point forecast per step is the median across draws;
+  `forecast.csv` also carries `close_p10`/`close_p90` per step. The
+  supplied context is capped at the model's 512-token attention
+  window before sampling (see the script docstring for the evidence).
 
 ## Outputs (in the `results` artifact)
 

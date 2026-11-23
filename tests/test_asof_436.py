@@ -107,7 +107,7 @@ def fake_fetch(ticker):
     return _frame(), "stub"
 
 
-def fake_forecast(context_df, pred_len):
+def fake_forecast(context_df, pred_len, samples=None):
     seen["context"] = context_df.copy()
     dates = pd.bdate_range("2024-03-04", periods=pred_len)
     return pd.DataFrame(
