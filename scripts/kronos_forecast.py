@@ -36,6 +36,9 @@ RESULTS_DIR = "results"
 DROP_BEFORE = pd.Timestamp("2019-01-01")
 MODEL_ID = "NeoQuasar/Kronos-small"
 TOKENIZER_ID = "NeoQuasar/Kronos-Tokenizer-base"
+# Pinned HF revisions actually loaded (borsagator #436 reproducibility)
+MODEL_REVISION = "901c26c1332695a2a8f243eb2f37243a37bea320"
+TOKENIZER_REVISION = "0e0117387f39004a9016484a186a908917e22426"
 UPSTREAM_KRONOS_REPO = "https://github.com/shiyu-coder/Kronos.git"
 # Pinned upstream commit (borsagator #436 reproducibility): the clone
 # is checked out at this commit instead of tracking upstream HEAD, so
@@ -270,30 +273,6 @@ def kronos_src_commit(kronos_src):
     return "unknown"
 
 
-def hf_revision(repo_id, obj=None):
-    """Best-effort HF revision (commit hash) for a model/tokenizer.
-
-    Tries the loaded object's config first, then the Hub API. Report
-    metadata only: any failure degrades to "unknown" and never fails
-    the run (borsagator #436 reproducibility record).
-    """
-    try:
-        rev = getattr(getattr(obj, "config", None), "_commit_hash", None)
-        if rev:
-            return str(rev)
-    except Exception:  # noqa: BLE001 - report metadata only
-        pass
-    try:
-        from huggingface_hub import HfApi
-
-        info = HfApi().model_info(repo_id)
-        if getattr(info, "sha", None):
-            return str(info.sha)
-    except Exception:  # noqa: BLE001 - report metadata only
-        pass
-    return "unknown"
-
-
 def dependency_versions():
     """Installed versions of the packages that shape a forecast."""
     from importlib.metadata import PackageNotFoundError, version
@@ -329,8 +308,8 @@ def run_forecast(context_df, pred_len):
         pass
     from model import Kronos, KronosPredictor, KronosTokenizer
 
-    tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_ID)
-    model = Kronos.from_pretrained(MODEL_ID)
+    tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_ID, revision=TOKENIZER_REVISION)
+    model = Kronos.from_pretrained(MODEL_ID, revision=MODEL_REVISION)
     predictor = KronosPredictor(model, tokenizer, device="cpu",
                                 max_context=MAX_CONTEXT)
 
@@ -346,8 +325,8 @@ def run_forecast(context_df, pred_len):
         context_used=len(context_df),
         max_context=MAX_CONTEXT,
         upstream_commit=kronos_src_commit(kronos_src),
-        model_revision=hf_revision(MODEL_ID, model),
-        tokenizer_revision=hf_revision(TOKENIZER_ID, tokenizer),
+        model_revision=MODEL_REVISION,
+        tokenizer_revision=TOKENIZER_REVISION,
         dependency_versions=dependency_versions(),
     )
     print(f"[context] supplied={supplied_len} used={len(context_df)} "
@@ -441,7 +420,7 @@ def main():
     lines.append("")
     lines.append(f"- Model: `{MODEL_ID}` with tokenizer `{TOKENIZER_ID}` (CPU inference, seed 42, T=1.0, top_p=0.9, sample_count=1)")
     lines.append(f"- Data source: {source} (yfinance is never used for Cairo tickers — Africa/Cairo DST crash; rows before 2019-01-01 dropped as corrupted)")
-    lines.append(f"- Context window used: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
+    lines.append(f"- Context window selected: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
     if args.as_of:
         lines.append(f"- As-of cutoff: {args.as_of} (walk-forward backtest, borsagator #436 — every session after the cutoff was dropped before the model ran; context ends at the cutoff)")
     meta = LAST_RUN_META
