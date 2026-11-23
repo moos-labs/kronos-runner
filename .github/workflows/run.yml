@@ -33,6 +33,8 @@ jobs:
           pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           git clone --depth 1 https://github.com/shiyu-coder/Kronos.git kronos_src
+          git -C kronos_src fetch --depth 1 origin 67b630e67f6a18c9e9be918d9b4337c960db1e9a
+          git -C kronos_src checkout --detach 67b630e67f6a18c9e9be918d9b4337c960db1e9a
           pip install -r kronos_src/requirements.txt
           pip install -r requirements.txt
 
