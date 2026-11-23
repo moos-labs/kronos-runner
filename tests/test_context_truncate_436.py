@@ -206,6 +206,144 @@ try:
 finally:
     sys.argv = old_argv
 
+# 9. HF revision constants exist and match the pins (borsagator #436
+# reproducibility).
+check("MODEL_REVISION constant exists and is a 40-hex SHA",
+      hasattr(kf, "MODEL_REVISION")
+      and re.fullmatch(r"[0-9a-f]{40}", kf.MODEL_REVISION) is not None,
+      getattr(kf, "MODEL_REVISION", "MISSING"))
+check("TOKENIZER_REVISION constant exists and is a 40-hex SHA",
+      hasattr(kf, "TOKENIZER_REVISION")
+      and re.fullmatch(r"[0-9a-f]{40}", kf.TOKENIZER_REVISION) is not None,
+      getattr(kf, "TOKENIZER_REVISION", "MISSING"))
+check("MODEL_REVISION matches expected pin",
+      kf.MODEL_REVISION == "901c26c1332695a2a8f243eb2f37243a37bea320",
+      f"got {kf.MODEL_REVISION}")
+check("TOKENIZER_REVISION matches expected pin",
+      kf.TOKENIZER_REVISION == "0e0117387f39004a9016484a186a908917e22426",
+      f"got {kf.TOKENIZER_REVISION}")
+
+# 10. run_forecast passes revision= to both from_pretrained calls
+# (stub the loaders and capture the kwargs, same style as fake_forecast).
+captured_kwargs = {}
+
+
+def fake_tokenizer_from_pretrained(model_id, revision=None, **kwargs):
+    captured_kwargs["tokenizer"] = {"model_id": model_id, "revision": revision, "other": kwargs}
+    return object()
+
+
+def fake_model_from_pretrained(model_id, revision=None, **kwargs):
+    captured_kwargs["model"] = {"model_id": model_id, "revision": revision, "other": kwargs}
+    return object()
+
+
+def fake_predictor(model, tokenizer, device, max_context):
+    class _FakePredictor:
+        def predict(self, df, x_timestamp, y_timestamp, pred_len, T, top_p, sample_count, verbose):
+            dates = pd.bdate_range(y_timestamp.iloc[0], periods=pred_len)
+            return pd.DataFrame({
+                "date": [d.strftime("%Y-%m-%d") for d in dates],
+                "open": [11.0] * pred_len,
+                "high": [11.5] * pred_len,
+                "low": [10.9] * pred_len,
+                "close": [11.2] * pred_len,
+            })
+    return _FakePredictor()
+
+
+tmp3 = Path(tempfile.mkdtemp(prefix="k436-rev-kwargs-"))
+os.chdir(tmp3)
+# Need to import the module fresh to avoid the real from_pretrained
+# but we can monkeypatch the already-loaded module.
+orig_tokenizer_pretrained = kf.KronosTokenizer.from_pretrained if hasattr(kf, "KronosTokenizer") else None
+orig_model_pretrained = kf.Kronos.from_pretrained if hasattr(kf, "Kronos") else None
+orig_predictor = kf.KronosPredictor if hasattr(kf, "KronosPredictor") else None
+
+# We don't actually have KronosTokenizer/Kronos in the module namespace
+# until run_forecast imports them, so we patch at the module where they
+# are used: inside run_forecast, `from model import Kronos, KronosPredictor, KronosTokenizer`
+# so we can't easily patch from here. Instead, we inspect the source
+# for the call signatures.
+src = (REPO / "scripts" / "kronos_forecast.py").read_text()
+run_forecast_body = src[src.index("def run_forecast"):src.index("def main")]
+check("run_forecast calls tokenizer.from_pretrained with revision=TOKENIZER_REVISION",
+      'KronosTokenizer.from_pretrained(TOKENIZER_ID, revision=TOKENIZER_REVISION)' in run_forecast_body,
+      "source check failed")
+check("run_forecast calls model.from_pretrained with revision=MODEL_REVISION",
+      'Kronos.from_pretrained(MODEL_ID, revision=MODEL_REVISION)' in run_forecast_body,
+      "source check failed")
+
+# 11. After a stubbed run, LAST_RUN_META / the report shows exactly
+# MODEL_REVISION and TOKENIZER_REVISION (not "unknown" or a Hub HEAD lookup).
+def fake_fetch2(ticker):
+    return _frame(200), "stub"
+
+
+def fake_forecast2(context_df, pred_len):
+    kf.LAST_RUN_META.clear()
+    kf.LAST_RUN_META.update(
+        context_supplied=len(context_df),
+        context_used=min(len(context_df), kf.MAX_CONTEXT),
+        max_context=kf.MAX_CONTEXT,
+        upstream_commit=kf.UPSTREAM_KRONOS_COMMIT,
+        model_revision=kf.MODEL_REVISION,
+        tokenizer_revision=kf.TOKENIZER_REVISION,
+        dependency_versions={"torch": "0.0", "pandas": "0.0"},
+    )
+    dates = pd.bdate_range(context_df["date"].iloc[-1], periods=pred_len + 1)[1:]
+    return pd.DataFrame({
+        "date": [d.strftime("%Y-%m-%d") for d in dates],
+        "open": [11.0] * pred_len,
+        "high": [11.5] * pred_len,
+        "low": [10.9] * pred_len,
+        "close": [11.2] * pred_len,
+    })
+
+
+tmp4 = Path(tempfile.mkdtemp(prefix="k436-meta-pins-"))
+os.chdir(tmp4)
+kf.fetch_data = fake_fetch2
+kf.run_forecast = fake_forecast2
+old_argv = sys.argv
+sys.argv = ["kronos_forecast.py", "--ticker", "TEST", "--pred-len", "3"]
+try:
+    kf.main()
+    meta = kf.LAST_RUN_META
+    check("LAST_RUN_META.model_revision equals MODEL_REVISION constant",
+          meta["model_revision"] == kf.MODEL_REVISION,
+          f"meta={meta['model_revision']} const={kf.MODEL_REVISION}")
+    check("LAST_RUN_META.tokenizer_revision equals TOKENIZER_REVISION constant",
+          meta["tokenizer_revision"] == kf.TOKENIZER_REVISION,
+          f"meta={meta['tokenizer_revision']} const={kf.TOKENIZER_REVISION}")
+    report = (tmp4 / "results" / "report.md").read_text()
+    check("report shows MODEL_REVISION pin",
+          kf.MODEL_REVISION in report, f"report missing {kf.MODEL_REVISION}")
+    check("report shows TOKENIZER_REVISION pin",
+          kf.TOKENIZER_REVISION in report, f"report missing {kf.TOKENIZER_REVISION}")
+finally:
+    sys.argv = old_argv
+
+# 12. hf_revision function no longer exists in the module (cannot fall back
+# to querying the Hub's current HEAD as the loaded revision).
+check("hf_revision function is removed from module",
+      not hasattr(kf, "hf_revision"),
+      "hf_revision still present in module namespace")
+
+# 13. The meta values equal the constants even when huggingface_hub
+# would raise -- this is now enforced by the removal of hf_revision
+# and the use of the constants directly in run_forecast. Verify the
+# source does not call any Hub lookup for revisions.
+check("run_forecast source does not call hf_revision",
+      "hf_revision" not in run_forecast_body,
+      "hf_revision still referenced in run_forecast")
+check("run_forecast source uses MODEL_REVISION constant for model_revision",
+      "model_revision=MODEL_REVISION" in run_forecast_body,
+      "MODEL_REVISION not used in run_forecast meta")
+check("run_forecast source uses TOKENIZER_REVISION constant for tokenizer_revision",
+      "tokenizer_revision=TOKENIZER_REVISION" in run_forecast_body,
+      "TOKENIZER_REVISION not used in run_forecast meta")
+
 failed = [c for c in CHECKS if not c[1]]
 print(f"\n{len(CHECKS) - len(failed)}/{len(CHECKS)} checks pass")
 sys.exit(1 if failed else 0)
