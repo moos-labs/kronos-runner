@@ -13,6 +13,16 @@ Preferred context: all sessions from --context-start (default
 If Kronos refuses that short context (or it is too short to attempt),
 fall back to the last --fallback-len sessions ending at the latest
 session and FLAG the merger discontinuity in the report.
+
+Context cap (borsagator #436, step-4 evidence): upstream
+``KronosPredictor.predict()`` computes its normalisation statistics
+over ALL supplied bars but attends over only the last ``max_context``
+tokens. Supplying more bars than the predictor attends to therefore
+anchors the forecast to the old regime (COMI.CA @ 2023-12-29: 1,231
+bars supplied -> month error 57.3 points; truncating the supplied
+context to the last 512 cut it to 17.8). The runner truncates the
+supplied frame to the last MAX_CONTEXT sessions before predict(), so
+normalisation and attention always cover the same window.
 """
 import argparse
 import os
@@ -27,6 +37,19 @@ DROP_BEFORE = pd.Timestamp("2019-01-01")
 MODEL_ID = "NeoQuasar/Kronos-small"
 TOKENIZER_ID = "NeoQuasar/Kronos-Tokenizer-base"
 UPSTREAM_KRONOS_REPO = "https://github.com/shiyu-coder/Kronos.git"
+# Pinned upstream commit (borsagator #436 reproducibility): the clone
+# is checked out at this commit instead of tracking upstream HEAD, so
+# a backtest cell runs the same model code every time. This is the
+# commit the #436 step 1-4 investigation actually measured.
+UPSTREAM_KRONOS_COMMIT = "67b630e67f6a18c9e9be918d9b4337c960db1e9a"
+# The predictor's attention window; also the cap on supplied context
+# (see the module docstring). Must match the max_context passed to
+# KronosPredictor in run_forecast.
+MAX_CONTEXT = 512
+# Metadata of the most recent run_forecast call, for the report:
+# supplied/used context lengths, upstream commit, HF revisions,
+# dependency versions. Empty until a forecast has run.
+LAST_RUN_META = {}
 
 
 def fetch_yahooquery(ticker):
@@ -128,6 +151,23 @@ def truncate_asof(df, as_of, min_rows):
     return out
 
 
+def truncate_context(df, max_context=MAX_CONTEXT):
+    """Keep only the last ``max_context`` sessions (borsagator #436).
+
+    Upstream ``predict()`` normalises over ALL supplied bars but
+    attends over only the last ``max_context`` tokens; supplying more
+    than that anchors the forecast to the old regime (step-4 evidence:
+    COMI.CA month error 57.3 points at 1,231 supplied bars vs 17.8 at
+    512). Truncating here -- inside the runner, before the model call
+    -- makes normalisation statistics and attention cover the same
+    window. A frame at or under the cap is returned untouched; order
+    is preserved.
+    """
+    if len(df) <= max_context:
+        return df
+    return df.tail(max_context).reset_index(drop=True)
+
+
 def select_context(df, context_start, fallback_len, min_context):
     """Preferred window ``context_start``..latest session; if that window
     is below ``min_context`` sessions, fall back to the last
@@ -184,6 +224,23 @@ def ensure_kronos_src(kronos_src="kronos_src", run=None):
         raise RuntimeError(
             "cloning upstream Kronos failed: %s"
             % ((r.stderr or r.stdout or "")[-500:]))
+    # Pin the fresh clone to UPSTREAM_KRONOS_COMMIT (borsagator #436):
+    # a --depth 1 clone tracks upstream HEAD, so fetch the pinned
+    # commit explicitly and detach there. Fail loudly if either step
+    # fails -- running against an unpinned upstream would silently
+    # make backtest cells non-reproducible.
+    for cmd in (
+        ["git", "-C", kronos_src, "fetch", "--depth", "1", "origin",
+         UPSTREAM_KRONOS_COMMIT],
+        ["git", "-C", kronos_src, "checkout", "--detach",
+         UPSTREAM_KRONOS_COMMIT],
+    ):
+        r = run(cmd, capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "pinning upstream Kronos to %s failed: %s"
+                % (UPSTREAM_KRONOS_COMMIT,
+                   (r.stderr or r.stdout or "")[-500:]))
     req = os.path.join(kronos_src, "requirements.txt")
     if os.path.isfile(req):
         r = run([sys.executable, "-m", "pip", "install", "-q",
@@ -194,6 +251,62 @@ def ensure_kronos_src(kronos_src="kronos_src", run=None):
                 "installing upstream Kronos requirements failed: %s"
                 % ((r.stderr or r.stdout or "")[-500:]))
     return True
+
+
+def kronos_src_commit(kronos_src):
+    """Full HEAD commit of the local upstream clone, or "unknown".
+
+    Read-only (``git rev-parse``); used only for the report, so any
+    failure degrades to "unknown" instead of failing the run.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", kronos_src, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:  # noqa: BLE001 - report metadata only
+        pass
+    return "unknown"
+
+
+def hf_revision(repo_id, obj=None):
+    """Best-effort HF revision (commit hash) for a model/tokenizer.
+
+    Tries the loaded object's config first, then the Hub API. Report
+    metadata only: any failure degrades to "unknown" and never fails
+    the run (borsagator #436 reproducibility record).
+    """
+    try:
+        rev = getattr(getattr(obj, "config", None), "_commit_hash", None)
+        if rev:
+            return str(rev)
+    except Exception:  # noqa: BLE001 - report metadata only
+        pass
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo_id)
+        if getattr(info, "sha", None):
+            return str(info.sha)
+    except Exception:  # noqa: BLE001 - report metadata only
+        pass
+    return "unknown"
+
+
+def dependency_versions():
+    """Installed versions of the packages that shape a forecast."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    out = {}
+    for pkg in ("torch", "pandas", "numpy", "transformers", "yahooquery"):
+        try:
+            out[pkg] = version(pkg)
+        except PackageNotFoundError:
+            out[pkg] = "not installed"
+        except Exception:  # noqa: BLE001 - report metadata only
+            out[pkg] = "unknown"
+    return out
 
 
 def run_forecast(context_df, pred_len):
@@ -218,7 +331,27 @@ def run_forecast(context_df, pred_len):
 
     tokenizer = KronosTokenizer.from_pretrained(TOKENIZER_ID)
     model = Kronos.from_pretrained(MODEL_ID)
-    predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
+    predictor = KronosPredictor(model, tokenizer, device="cpu",
+                                max_context=MAX_CONTEXT)
+
+    # Borsagator #436: cap the supplied context at the predictor's
+    # attention window BEFORE predict() -- upstream normalises over
+    # all supplied bars but attends over only the last MAX_CONTEXT,
+    # so a longer supply anchors the forecast to the old regime.
+    supplied_len = len(context_df)
+    context_df = truncate_context(context_df, MAX_CONTEXT)
+    LAST_RUN_META.clear()
+    LAST_RUN_META.update(
+        context_supplied=supplied_len,
+        context_used=len(context_df),
+        max_context=MAX_CONTEXT,
+        upstream_commit=kronos_src_commit(kronos_src),
+        model_revision=hf_revision(MODEL_ID, model),
+        tokenizer_revision=hf_revision(TOKENIZER_ID, tokenizer),
+        dependency_versions=dependency_versions(),
+    )
+    print(f"[context] supplied={supplied_len} used={len(context_df)} "
+          f"max_context={MAX_CONTEXT}")
 
     x_df = context_df[["open", "high", "low", "close", "volume"]].copy()
     x_timestamp = pd.Series(pd.to_datetime(context_df["date"]))
@@ -311,6 +444,28 @@ def main():
     lines.append(f"- Context window used: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
     if args.as_of:
         lines.append(f"- As-of cutoff: {args.as_of} (walk-forward backtest, borsagator #436 — every session after the cutoff was dropped before the model ran; context ends at the cutoff)")
+    meta = LAST_RUN_META
+    if meta:
+        if meta["context_supplied"] > meta["context_used"]:
+            cap_note = (f"truncated to the last {meta['context_used']} "
+                        f"before predict()")
+        else:
+            cap_note = "no truncation needed"
+        lines.append(
+            f"- Context supplied to Kronos: {meta['context_supplied']} sessions, "
+            f"{cap_note} (max_context={meta['max_context']}; upstream predict() "
+            "normalises over all supplied bars but attends over only the last "
+            "max_context — borsagator #436)")
+        lines.append(
+            f"- Upstream Kronos commit: `{meta['upstream_commit']}` "
+            f"(pinned target: `{UPSTREAM_KRONOS_COMMIT}`)")
+        lines.append(
+            f"- Hugging Face revisions: model `{MODEL_ID}` @ "
+            f"{meta['model_revision']}; tokenizer `{TOKENIZER_ID}` @ "
+            f"{meta['tokenizer_revision']}")
+        deps = ", ".join(f"{k} {v}"
+                         for k, v in meta["dependency_versions"].items())
+        lines.append(f"- Dependency versions: {deps}")
     if fallback_used:
         lines.append(f"- **FALLBACK USED**: {fallback_reason}. The fallback window spans the POUL merger discontinuity, so pre-merger and post-merger prices are mixed in one context — treat this forecast with extra caution.")
     else:
