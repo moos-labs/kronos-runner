@@ -157,7 +157,7 @@ def fake_fetch(ticker):
     return _frame(1231), "stub"
 
 
-def fake_forecast(context_df, pred_len):
+def fake_forecast(context_df, pred_len, samples=None):
     seen["supplied"] = len(context_df)
     kf.LAST_RUN_META.clear()
     kf.LAST_RUN_META.update(
@@ -280,7 +280,7 @@ def fake_fetch2(ticker):
     return _frame(200), "stub"
 
 
-def fake_forecast2(context_df, pred_len):
+def fake_forecast2(context_df, pred_len, samples=None):
     kf.LAST_RUN_META.clear()
     kf.LAST_RUN_META.update(
         context_supplied=len(context_df),

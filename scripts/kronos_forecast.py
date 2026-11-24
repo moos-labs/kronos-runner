@@ -23,6 +23,20 @@ bars supplied -> month error 57.3 points; truncating the supplied
 context to the last 512 cut it to 17.8). The runner truncates the
 supplied frame to the last MAX_CONTEXT sessions before predict(), so
 normalisation and attention always cover the same window.
+
+Multi-sampling (borsagator #436, panel evaluation 2026-11-23): Kronos
+is a sampling model, so a single ``sample_count=1`` draw is one sample
+from a distribution, not a forecast. The runner now draws N samples
+(default 32, ``--samples`` / ``KRONOS_SAMPLES``) and aggregates them
+per horizon step: the point forecast is the per-step MEDIAN and
+``forecast.csv`` also carries the per-step ``close_p10``/``close_p90``
+band. Upstream ``predict(sample_count=N)`` cannot be used for this --
+it averages its draws internally (``np.mean`` over the sample axis)
+and returns no quantiles -- so the runner calls ``predict()`` N times
+with ``sample_count=1``. The seed discipline is unchanged:
+``torch.manual_seed(42)`` is set once before the model loads and the
+draws consume the RNG stream in order, so a run is deterministic;
+``KRONOS_SAMPLES=1`` reproduces the old single-draw behaviour exactly.
 """
 import argparse
 import os
@@ -53,6 +67,10 @@ MAX_CONTEXT = 512
 # supplied/used context lengths, upstream commit, HF revisions,
 # dependency versions. Empty until a forecast has run.
 LAST_RUN_META = {}
+# Default number of Kronos sampling draws aggregated into one forecast
+# (borsagator #436 multi-sampling; see the module docstring). Override
+# with --samples or the KRONOS_SAMPLES environment variable.
+DEFAULT_SAMPLES = 32
 
 
 def fetch_yahooquery(ticker):
@@ -288,7 +306,71 @@ def dependency_versions():
     return out
 
 
-def run_forecast(context_df, pred_len):
+def resolve_samples(cli_value=None, env=None):
+    """Number of Kronos draws to aggregate (borsagator #436).
+
+    Precedence: ``--samples`` CLI value, then the ``KRONOS_SAMPLES``
+    environment variable, then DEFAULT_SAMPLES. Raises ValueError on
+    a non-integer or non-positive value so a misconfigured run fails
+    loudly instead of silently forecasting from one draw.
+    """
+    env = os.environ if env is None else env
+    raw = cli_value
+    if raw is None:
+        raw = env.get("KRONOS_SAMPLES")
+    if raw is None or raw == "":
+        return DEFAULT_SAMPLES
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid sample count {raw!r}: not an integer")
+    if n < 1:
+        raise ValueError(f"invalid sample count {raw!r}: must be >= 1")
+    return n
+
+
+def aggregate_samples(sample_frames):
+    """Aggregate N per-draw forecast frames into one forecast frame.
+
+    Each input frame is one ``predict(sample_count=1)`` draw with the
+    upstream columns (open, high, low, close, volume, amount). The
+    point forecast per horizon step is the MEDIAN across draws for
+    every column; two columns are added: ``close_p10`` and
+    ``close_p90``, the per-step 10th/90th percentiles of the close
+    across draws. With a single draw the median and both percentiles
+    equal that draw, so samples=1 reproduces the old output values.
+    Existing columns keep their names, order and meaning.
+    """
+    if not sample_frames:
+        raise ValueError("aggregate_samples: no sample frames")
+    import numpy as np
+
+    base = sample_frames[0]
+    out = pd.DataFrame(index=base.index)
+    for col in base.columns:
+        stack = np.stack(
+            [frame[col].to_numpy(dtype=float) for frame in sample_frames])
+        out[col] = np.median(stack, axis=0)
+    closes = np.stack(
+        [frame["close"].to_numpy(dtype=float) for frame in sample_frames])
+    out["close_p10"] = np.quantile(closes, 0.10, axis=0)
+    out["close_p90"] = np.quantile(closes, 0.90, axis=0)
+    return out
+
+
+def collect_sample_paths(predict_once, samples):
+    """Call ``predict_once`` ``samples`` times and aggregate the draws.
+
+    ``predict_once`` is a zero-argument callable returning one draw's
+    forecast frame. The draws consume the caller's RNG stream in
+    order (the seed is set once by the caller), so the sequence --
+    and therefore the aggregate -- is deterministic.
+    """
+    frames = [predict_once() for _ in range(samples)]
+    return aggregate_samples(frames)
+
+
+def run_forecast(context_df, pred_len, samples=None):
     # Kronos is not a PyPI package: the workflow clones the upstream repo
     # into kronos_src/ and we import its `model` package from there.
     kronos_src = os.environ.get("KRONOS_SRC", "kronos_src")
@@ -319,6 +401,7 @@ def run_forecast(context_df, pred_len):
     # so a longer supply anchors the forecast to the old regime.
     supplied_len = len(context_df)
     context_df = truncate_context(context_df, MAX_CONTEXT)
+    n_samples = resolve_samples(samples)
     LAST_RUN_META.clear()
     LAST_RUN_META.update(
         context_supplied=supplied_len,
@@ -328,25 +411,44 @@ def run_forecast(context_df, pred_len):
         model_revision=MODEL_REVISION,
         tokenizer_revision=TOKENIZER_REVISION,
         dependency_versions=dependency_versions(),
+        samples=n_samples,
     )
     print(f"[context] supplied={supplied_len} used={len(context_df)} "
           f"max_context={MAX_CONTEXT}")
+    print(f"[samples] draws={n_samples} aggregation=per-step median "
+          f"(close_p10/close_p90 across draws)")
 
     x_df = context_df[["open", "high", "low", "close", "volume"]].copy()
     x_timestamp = pd.Series(pd.to_datetime(context_df["date"]))
     last_date = pd.Timestamp(context_df["date"].iloc[-1])
     y_timestamp = next_sessions(last_date, pred_len)
 
-    pred_df = predictor.predict(
-        df=x_df,
-        x_timestamp=x_timestamp,
-        y_timestamp=y_timestamp,
-        pred_len=pred_len,
-        T=1.0,
-        top_p=0.9,
-        sample_count=1,
-        verbose=True,
-    )
+    # Multi-sampling (borsagator #436): N independent sample_count=1
+    # draws, aggregated per step by collect_sample_paths. Upstream
+    # predict(sample_count=N) averages its draws internally and
+    # returns no quantiles, so the loop is the only way to a median
+    # and a p10/p90 band. The seed was set once above; the draws
+    # consume the RNG stream in order, keeping the run deterministic.
+    draw_no = [0]
+
+    def predict_once():
+        draw_no[0] += 1
+        t0 = time.time()
+        frame = predictor.predict(
+            df=x_df,
+            x_timestamp=x_timestamp,
+            y_timestamp=y_timestamp,
+            pred_len=pred_len,
+            T=1.0,
+            top_p=0.9,
+            sample_count=1,
+            verbose=(draw_no[0] == 1),
+        )
+        print(f"[samples] draw {draw_no[0]}/{n_samples} "
+              f"in {time.time() - t0:.1f}s")
+        return frame
+
+    pred_df = collect_sample_paths(predict_once, n_samples)
     pred_df = pred_df.reset_index(drop=True)
     pred_df.insert(0, "date", [d.strftime("%Y-%m-%d") for d in y_timestamp])
     return pred_df
@@ -366,6 +468,12 @@ def main():
                          "drop every session after this date before any "
                          "model call, so the forecast sees only data "
                          "available at the close of that date.")
+    ap.add_argument("--samples", type=int, default=None,
+                    help="Number of Kronos sampling draws aggregated into "
+                         "the forecast (per-step median + close p10/p90). "
+                         "Default: KRONOS_SAMPLES env var, else "
+                         f"{DEFAULT_SAMPLES}. 1 reproduces the old "
+                         "single-draw behaviour.")
     args = ap.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -388,7 +496,7 @@ def main():
     print(f"[context] preferred_sessions={len(df[df['date'] >= pd.Timestamp(args.context_start)])} using={len(context)} fallback={fallback_used}")
 
     try:
-        pred_df = run_forecast(context, args.pred_len)
+        pred_df = run_forecast(context, args.pred_len, samples=args.samples)
     except Exception as exc:  # Kronos refused the short context -> fallback
         if fallback_used:
             raise
@@ -397,10 +505,10 @@ def main():
         fallback_reason = f"Kronos refused the preferred short context: {exc}"
         context = df.tail(args.fallback_len).reset_index(drop=True)
         print(f"[context] falling back to last {len(context)} sessions")
-        pred_df = run_forecast(context, args.pred_len)
+        pred_df = run_forecast(context, args.pred_len, samples=args.samples)
 
     out_cols = ["date", "open", "high", "low", "close"]
-    for extra in ("volume", "amount"):
+    for extra in ("close_p10", "close_p90", "volume", "amount"):
         if extra in pred_df.columns:
             out_cols.append(extra)
     forecast_csv = pred_df[out_cols].copy()
@@ -418,7 +526,8 @@ def main():
     lines = []
     lines.append(f"# Kronos-small forecast — {args.ticker}")
     lines.append("")
-    lines.append(f"- Model: `{MODEL_ID}` with tokenizer `{TOKENIZER_ID}` (CPU inference, seed 42, T=1.0, top_p=0.9, sample_count=1)")
+    n_samples = LAST_RUN_META.get("samples", 1)
+    lines.append(f"- Model: `{MODEL_ID}` with tokenizer `{TOKENIZER_ID}` (CPU inference, seed 42, T=1.0, top_p=0.9, samples={n_samples} draws aggregated per step by median; forecast.csv also carries close_p10/close_p90 across draws)")
     lines.append(f"- Data source: {source} (yfinance is never used for Cairo tickers — Africa/Cairo DST crash; rows before 2019-01-01 dropped as corrupted)")
     lines.append(f"- Context window used: {ctx_start.date()} to {ctx_end.date()} — {len(context)} sessions")
     if args.as_of:
